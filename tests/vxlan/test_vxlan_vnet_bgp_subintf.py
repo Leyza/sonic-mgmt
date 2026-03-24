@@ -2,17 +2,18 @@ import logging
 import json
 import os
 from ptf.mask import Mask
-from ptf.packet import Ether, IP, UDP, TCP, Dot1Q
+from ptf.packet import Ether, IP, UDP, TCP
 import ptf.testutils as testutils
 import pytest
 import time
+from tests.common.gnmi_setup import apply_cert_config, recover_cert_config
 from tests.common.helpers.assertions import pytest_assert, pytest_require
 from tests.common.config_reload import config_reload
 from tests.common.utilities import wait_until
 from tests.common.vxlan_ecmp_utils import Ecmp_Utils
 from tests.common.helpers.dut_utils import check_container_state
-from tests.gnmi.helper import gnmi_container, apply_cert_config, recover_cert_config
-from tests.common.helpers.gnmi_utils import GNMIEnvironment, create_gnmi_certs, delete_gnmi_certs
+from tests.common.helpers.gnmi_utils import GNMIEnvironment, gnmi_container, create_gnmi_certs, \
+    delete_gnmi_certs
 
 ecmp_utils = Ecmp_Utils()
 
@@ -308,8 +309,10 @@ def generate_subintfs_ips(num_vnets, num_portchannels, start_ip_int, prefix_size
     Generate subnets for subintfs, incrementing third octect for each vnet, and fourth octet for each portchannel.
     """
     num_ips_per_prefix = 2 ** (32 - prefix_size)
-    pytest_assert(num_ips_per_prefix * num_portchannels + (start_ip_int & 0xFF) < 0xFF, "Not enough IP addresses in last octet to allocate for subinterfaces.")
-    pytest_assert(num_vnets + (start_ip_int >> 8 & 0xFF) < 0xFF, "Not enough IP addresses in third octet to allocate for subinterfaces.")
+    pytest_assert(num_ips_per_prefix * num_portchannels + (start_ip_int & 0xFF) < 0xFF,
+                  "Not enough IP addresses in last octet to allocate for subinterfaces.")
+    pytest_assert(num_vnets + (start_ip_int >> 8 & 0xFF) < 0xFF,
+                  "Not enough IP addresses in third octet to allocate for subinterfaces.")
 
     all_subintf_ips = []
     all_ptf_ips = []
@@ -393,19 +396,19 @@ def setup_acl_config(duthost, ptfhost, ports, vnet_vnis):
 
     # Check acl table and rules are set
     def _acl_table_and_rule_active(duthost):
-            acl_table = duthost.shell(
-                f"sonic-db-cli STATE_DB HGET 'ACL_TABLE_TABLE|{ACL_TABLE_NAME}' 'status'",
+        acl_table = duthost.shell(
+            f"sonic-db-cli STATE_DB HGET 'ACL_TABLE_TABLE|{ACL_TABLE_NAME}' 'status'",
+            module_ignore_errors=True)
+        if acl_table.get('stdout', '').strip().lower() != "active":
+            return False
+
+        for vni in vnet_vnis:
+            acl_rule = duthost.shell(
+                f"sonic-db-cli STATE_DB HGET 'ACL_RULE_TABLE|{ACL_TABLE_NAME}|rule_{vni}' 'status'",
                 module_ignore_errors=True)
-            if acl_table.get('stdout', '').strip().lower() != "active":
+            if acl_rule.get('stdout', '').strip().lower() != "active":
                 return False
-            
-            for vni in vnet_vnis:
-                acl_rule = duthost.shell(
-                    f"sonic-db-cli STATE_DB HGET 'ACL_RULE_TABLE|{ACL_TABLE_NAME}|rule_{vni}' 'status'",
-                    module_ignore_errors=True)
-                if acl_rule.get('stdout', '').strip().lower() != "active":
-                    return False
-            return True
+        return True
 
     pytest_assert(wait_until(60, 2, 0, _acl_table_and_rule_active, duthost),
                   f"ACL table {ACL_TABLE_NAME} or its rules not active after 60 seconds.")
@@ -416,7 +419,7 @@ def setup_vnet_routes(duthost, ptfhost, vnet_vnis):
         f"Vnet{vni}|0.0.0.0/0": {
             "endpoint": TUNNEL_ENDPOINT
         } for vni in vnet_vnis
-    }, f"vnet_routes")
+    }, "vnet_routes")
 
     # Check vnet routes are set
     time.sleep(5)
@@ -432,7 +435,7 @@ def setup_bgp(duthost, ptfhost, vnet_vnis, dut_ips, ptf_ips, subnet_ip, loopback
     dut_asn = config_facts['DEVICE_METADATA']['localhost']['bgp_asn']
     neighbors = config_facts['BGP_NEIGHBOR']
     peer_asn = list(neighbors.values())[0]["asn"]
-    
+
     for vni in vnet_vnis:
         gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/BGP_PEER_RANGE/Vnet{vni}|WLPARTNER_PASSIVE_V4", {
             "ip_range": [subnet_ip],
@@ -467,7 +470,7 @@ neighbor {dut_ip.split('/')[0]} {{
     }}
 }}
 """
-        
+
     with open('/tmp/exabgp_update.conf', "w") as f:
         f.write(exabgp_config)
 
@@ -513,7 +516,12 @@ def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, ba
                     "vlan": str(base_vlan + i),
                     "vnet_name": f"Vnet{vnet_vnis[i]}"
                 }, subintf_name)
-                gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}|{dut_ips[j][i].replace('/','~1')}", {}, f"{subintf_name}_ip")
+                gnmi_update_helper(
+                    duthost,
+                    ptfhost,
+                    f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}|{dut_ips[j][i].replace('/','~1')}",
+                    {},
+                    f"{subintf_name}_ip")
 
             # Configure ptf port commands
             cmds.append(f"ip link add link {bond_port} name {bond_port}.{base_vlan + i} type vlan id {base_vlan + i}")
@@ -541,7 +549,8 @@ def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, ba
 
 def setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_available_in_topo):
     vlan_id, ports = get_available_vlan_id_and_ports(config_facts, len(PORTCHANNEL_NAMES))
-    pytest_assert(len(ports) == len(PORTCHANNEL_NAMES), f"Found {len(ports)} available ports. Needed {len(PORTCHANNEL_NAMES)} ports for the test.")
+    pytest_assert(len(ports) == len(PORTCHANNEL_NAMES),
+                  f"Found {len(ports)} available ports. Needed {len(PORTCHANNEL_NAMES)} ports for the test.")
 
     cmds = []
     wl_portchannel_mapping_info = {}
@@ -551,7 +560,12 @@ def setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_a
         gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/PORTCHANNEL/{PORTCHANNEL_NAMES[i]}", {
             "admin_status": "up"
         }, PORTCHANNEL_NAMES[i])
-        gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/PORTCHANNEL_MEMBER/{PORTCHANNEL_NAMES[i]}|{ports[i]}", {}, f"{PORTCHANNEL_NAMES[i]}_member")
+        gnmi_update_helper(
+            duthost,
+            ptfhost,
+            f"{GNMI_PATH_PREFIX}/PORTCHANNEL_MEMBER/{PORTCHANNEL_NAMES[i]}|{ports[i]}",
+            {},
+            f"{PORTCHANNEL_NAMES[i]}_member")
 
         # Configure ptf port commands
         ptf_port_index = port_indexes[ports[i]]
@@ -634,7 +648,7 @@ def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, 
         host_interfaces = tbinfo["topo"]["ptf_map"][str(dut_indx)]  # map of ptf port index to dut port index
         ptf_ports_available_in_topo = {}
         for key in host_interfaces:
-            ptf_ports_available_in_topo[host_interfaces[key]] = { # map of dut port index to ptf port info
+            ptf_ports_available_in_topo[host_interfaces[key]] = {  # map of dut port index to ptf port info
                 "index": int(key),
                 "name": "eth{}".format(int(key))
             }
@@ -660,14 +674,31 @@ def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, 
         vnet_vnis = setup_vnets(duthost, ptfhost, NUM_VNETS, "tunnel_v4", BASE_VNI)
 
         # Set up portchannels
-        wl_portchannel_info = setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_available_in_topo)
+        wl_portchannel_info = setup_portchannels(duthost, ptfhost, config_facts,
+                                                 port_indexes, ptf_ports_available_in_topo)
 
         # Set up subintfs
         dut_ips, ptf_ips = generate_subintfs_ips(NUM_VNETS, len(PORTCHANNEL_NAMES), start_ip_int=subnet_ip_int)
-        subintfs_info = setup_portchannel_subintfs(duthost, ptfhost, wl_portchannel_info, vnet_vnis, base_vlan=10, dut_ips=dut_ips, ptf_ips=ptf_ips)
+        subintfs_info = setup_portchannel_subintfs(
+            duthost,
+            ptfhost,
+            wl_portchannel_info,
+            vnet_vnis,
+            base_vlan=10,
+            dut_ips=dut_ips,
+            ptf_ips=ptf_ips)
 
         # Set up bgps
-        setup_bgp(duthost, ptfhost, vnet_vnis, dut_ips, ptf_ips, subnet_ip, loopback_ip, bgp_port=EXABGP_PORT, vnet_route_ip=subnet_ip)
+        setup_bgp(
+            duthost,
+            ptfhost,
+            vnet_vnis,
+            dut_ips,
+            ptf_ips,
+            subnet_ip,
+            loopback_ip,
+            bgp_port=EXABGP_PORT,
+            vnet_route_ip=subnet_ip)
 
         # Set up vnet routes
         setup_vnet_routes(duthost, ptfhost, vnet_vnis)
@@ -703,7 +734,8 @@ def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, 
         cleanup(duthost, ptfhost, localhost, wl_portchannel_info, subintfs_info)
         pytest.fail(f"Setup failed: {repr(e)}")
 
-    yield duthost, ptfadapter, wl_portchannel_info, subintfs_info, {"vnet_vnis": vnet_vnis, "t1_ptf_port_nums": t1_ptf_port_nums, "loopback_ip": loopback_ip}
+    test_configs = {"vnet_vnis": vnet_vnis, "t1_ptf_port_nums": t1_ptf_port_nums, "loopback_ip": loopback_ip}
+    yield duthost, ptfadapter, wl_portchannel_info, subintfs_info, test_configs
 
     # Cleanup
     cleanup(duthost, ptfhost, localhost, wl_portchannel_info, subintfs_info)
