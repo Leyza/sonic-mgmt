@@ -336,7 +336,10 @@ def generate_subintfs_ips(num_vnets, num_portchannels, start_ip_int, prefix_size
     return all_subintf_ips, all_ptf_ips
 
 
-def gnmi_update_helper(duthost, ptfhost, path, value, filename="test_config"):
+def gnmi_set_update_config_db_json(duthost, ptfhost, path, value, filename="test_config"):
+    """
+    Send GNMI set request with GNMI client. This helper will only send add/update requests with a json value format.
+    """
     filename += ".txt"
     with open(filename, 'w') as file:
         file.write(json.dumps(value))
@@ -359,7 +362,7 @@ def setup_acl_config(duthost, ptfhost, ports, vnet_vnis):
     """
     Add a custom ACL table type definition to CONFIG_DB.
     """
-    gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/ACL_TABLE_TYPE", {
+    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/ACL_TABLE_TYPE", {
         ACL_TYPE_NAME: {
             "BIND_POINTS": [
                 "PORT",
@@ -376,7 +379,7 @@ def setup_acl_config(duthost, ptfhost, ports, vnet_vnis):
         }
     }, "acl_type")
 
-    gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/ACL_TABLE", {
+    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/ACL_TABLE", {
         ACL_TABLE_NAME: {
             "policy_desc": ACL_TABLE_NAME,
             "ports": ports,
@@ -385,7 +388,7 @@ def setup_acl_config(duthost, ptfhost, ports, vnet_vnis):
         }
     }, "acl_table")
 
-    gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/ACL_RULE", {
+    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/ACL_RULE", {
         f"{ACL_TABLE_NAME}|rule_{vni}": {
             "INNER_SRC_IP": f"{INNER_SRC_IP}/32",
             "INNER_SRC_MAC_REWRITE_ACTION": INNER_SRC_MAC,
@@ -415,7 +418,7 @@ def setup_acl_config(duthost, ptfhost, ports, vnet_vnis):
 
 
 def setup_vnet_routes(duthost, ptfhost, vnet_vnis):
-    gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VNET_ROUTE_TUNNEL", {
+    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VNET_ROUTE_TUNNEL", {
         f"Vnet{vni}|0.0.0.0/0": {
             "endpoint": TUNNEL_ENDPOINT
         } for vni in vnet_vnis
@@ -437,12 +440,17 @@ def setup_bgp(duthost, ptfhost, vnet_vnis, dut_ips, ptf_ips, subnet_ip, loopback
     peer_asn = list(neighbors.values())[0]["asn"]
 
     for vni in vnet_vnis:
-        gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/BGP_PEER_RANGE/Vnet{vni}|WLPARTNER_PASSIVE_V4", {
-            "ip_range": [subnet_ip],
-            "name": "WLPARTNER_PASSIVE_V4",
-            "peer_asn": peer_asn,
-            "src_address": loopback_ip
-        }, f"bgp_peer_{vni}")
+        gnmi_set_update_config_db_json(
+            duthost,
+            ptfhost,
+            f"{GNMI_PATH_PREFIX}/BGP_PEER_RANGE/Vnet{vni}|WLPARTNER_PASSIVE_V4",
+            {
+                "ip_range": [subnet_ip],
+                "name": "WLPARTNER_PASSIVE_V4",
+                "peer_asn": peer_asn,
+                "src_address": loopback_ip
+            },
+            f"bgp_peer_{vni}")
 
     exabgp_config = f"""
 process api-vnets {{
@@ -501,7 +509,7 @@ def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, ba
             subintf_name = f"Po{po_num}.{base_vlan + i}"
 
             if not has_subintfs:
-                gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE", {
+                gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE", {
                     subintf_name: {
                         "admin_status": "up",
                         "vlan": str(base_vlan + i),
@@ -511,12 +519,17 @@ def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, ba
                 }, subintf_name)
                 has_subintfs = True
             else:
-                gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}", {
-                    "admin_status": "up",
-                    "vlan": str(base_vlan + i),
-                    "vnet_name": f"Vnet{vnet_vnis[i]}"
-                }, subintf_name)
-                gnmi_update_helper(
+                gnmi_set_update_config_db_json(
+                    duthost,
+                    ptfhost,
+                    f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}",
+                    {
+                        "admin_status": "up",
+                        "vlan": str(base_vlan + i),
+                        "vnet_name": f"Vnet{vnet_vnis[i]}"
+                    },
+                    subintf_name)
+                gnmi_set_update_config_db_json(
                     duthost,
                     ptfhost,
                     f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}|{dut_ips[j][i].replace('/','~1')}",
@@ -557,10 +570,10 @@ def setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_a
     for i in range(len(PORTCHANNEL_NAMES)):
         duthost.shell(f'config vlan member del {vlan_id} {ports[i]}')
 
-        gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/PORTCHANNEL/{PORTCHANNEL_NAMES[i]}", {
+        gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/PORTCHANNEL/{PORTCHANNEL_NAMES[i]}", {
             "admin_status": "up"
         }, PORTCHANNEL_NAMES[i])
-        gnmi_update_helper(
+        gnmi_set_update_config_db_json(
             duthost,
             ptfhost,
             f"{GNMI_PATH_PREFIX}/PORTCHANNEL_MEMBER/{PORTCHANNEL_NAMES[i]}|{ports[i]}",
@@ -568,8 +581,9 @@ def setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_a
             f"{PORTCHANNEL_NAMES[i]}_member")
 
         # Configure ptf port commands
-        ptf_port_index = port_indexes[ports[i]]
-        ptf_port_name = ptf_ports_available_in_topo[ptf_port_index]["name"]
+        dut_port_index = port_indexes[ports[i]]
+        ptf_port_name = ptf_ports_available_in_topo[dut_port_index]["name"]
+        ptf_port_index = ptf_ports_available_in_topo[dut_port_index]["index"]
 
         bond_port = 'bond{}'.format(ptf_port_index)
         cmds.append("ip link add {} type bond".format(bond_port))
@@ -594,7 +608,7 @@ def setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_a
 
 
 def setup_vnets(duthost, ptfhost, num_vnets, tunnel, base_vni):
-    gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VNET", {
+    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VNET", {
         f"Vnet{base_vni + i}": {
             "vni": f"{base_vni + i}",
             "vxlan_tunnel": tunnel
@@ -605,7 +619,7 @@ def setup_vnets(duthost, ptfhost, num_vnets, tunnel, base_vni):
 
 
 def setup_vxlan_tunnel(duthost, ptfhost, name, src_ip):
-    gnmi_update_helper(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VXLAN_TUNNEL", {
+    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VXLAN_TUNNEL", {
         name: {
             "src_ip": src_ip
         }
