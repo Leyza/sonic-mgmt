@@ -142,7 +142,7 @@ def vxlan_setup_one_vnet(duthost, ptfhost, tbinfo, cfg_facts,
     logger.info(f"Programming route {PREFIX} -> {','.join(INITIAL_ENDPOINTS)}")
     apply_chunk(
         duthost,
-        {"VNET_ROUTE_TUNNEL": {f"{VNET_NAME}|{PREFIX}": {"endpoint": ",".join(INITIAL_ENDPOINTS), "vni": str(VNI)}}},
+        {"VNET_ROUTE_TUNNEL": {f"{VNET_NAME}|{PREFIX}": {"endpoint": ",".join(INITIAL_ENDPOINTS)}}},
         "route_tunnel",
     )
     time.sleep(5)
@@ -199,7 +199,7 @@ def one_vnet_setup_teardown(
 
 
 # ---------- PTF runner helper ----------
-def run_vxlan_ptf_test(ptfhost, endpoints, params, num_packets, mac_list=None):
+def run_vxlan_ptf_test(ptfhost, endpoints, params, num_packets, mac_list=None, vni_list=None):
     logger.info(f"Calling VXLAN ECMP PTF test: {len(endpoints)} endpoints, {num_packets} packets")
 
     endpoints_file = "/tmp/ptf_endpoints.json"
@@ -214,6 +214,12 @@ def run_vxlan_ptf_test(ptfhost, endpoints, params, num_packets, mac_list=None):
         ptfhost.copy(content=json.dumps(mac_list), dest=macs_file)
         ptf_params.update({
             "macs_file": macs_file,
+        })
+    if vni_list:
+        vni_file = "/tmp/ptf_vni.json"
+        ptfhost.copy(content=json.dumps(vni_list), dest=vni_file)
+        ptf_params.update({
+            "vni_file": vni_file,
         })
     params_path = "/tmp/ptf_params.json"
     ptfhost.copy(content=json.dumps(ptf_params), dest=params_path)
@@ -271,7 +277,7 @@ def test_ecmp_scale(ptfhost, one_vnet_setup_teardown):
     )
 
 
-def test_vxlan_mac_vni(ptfhost, one_vnet_setup_teardown):
+def test_ecmp_mac_vni(ptfhost, one_vnet_setup_teardown):
     """
     Validate that endpoint[i] → mac_address[i] mapping is honored
     for a single prefix with multiple endpoints.
@@ -310,7 +316,6 @@ def test_vxlan_mac_vni(ptfhost, one_vnet_setup_teardown):
     ptf_params = setup.copy()
     ptf_params.update({
         "mac_vni_verify": "yes",
-        "vni": updated_vni,
     })
 
     logger.info("Calling PTF for MAC+VNI multi-endpoint validation...")
@@ -320,7 +325,63 @@ def test_vxlan_mac_vni(ptfhost, one_vnet_setup_teardown):
         endpoints,
         ptf_params,
         num_packets=num_packets,
-        mac_list=mac_list
+        mac_list=mac_list,
+        vni_list=[updated_vni]
+    )
+
+    logger.info("MAC+VNI multi-endpoint scale test completed successfully")
+
+
+def test_ecmp_same_endpoint_diff_mac_vni(ptfhost, one_vnet_setup_teardown):
+    """
+    Validate single prefix ecmp route with same endpoints but different mac and vni
+    """
+
+    setup, duthost, _ = one_vnet_setup_teardown
+    num_endpoints = setup["num_endpoints"]
+
+    logger.info(f"Running SAME ENDPOINTS DIFF MAC+VNI scale test with {num_endpoints} endpoints")
+
+    # --- Build endpoints list ---
+    base_ip = int(IPv4Address("100.0.50.1"))
+    endpoints = [str(IPv4Address(base_ip)) for _ in range(num_endpoints)]
+
+    # --- Build deterministic MAC list ---
+    # 52:54:00:00:xx:yy (unique per endpoint)
+    mac_list = [f"52:54:00:{i//256:02x}:{i%256:02x}:aa" for i in range(num_endpoints)]
+    mac_list_str = ",".join(mac_list)
+    vni_list = [5000 + i for i in range(num_endpoints)]
+    vni_list_str = ",".join(str(vni) for vni in vni_list)
+
+    logger.info(f"Generated {len(endpoints)} endpoints + {len(mac_list)} MACs")
+    logger.info(f"MAC list: {mac_list_str}")
+
+    # --- Program into VNET_ROUTE_TUNNEL table ---
+    _update_vxlan_endpoints(
+        duthost,
+        VNET_NAME,
+        PREFIX,
+        endpoints,
+        vni_list_str,
+        mac_address=mac_list_str
+    )
+
+    # --- Prepare PTF params ---
+    num_packets = num_endpoints * PACKET_MULTIPLIER
+    ptf_params = setup.copy()
+    ptf_params.update({
+        "mac_vni_verify": "yes",
+    })
+
+    logger.info("Calling PTF for MAC+VNI multi-endpoint validation...")
+
+    run_vxlan_ptf_test(
+        ptfhost,
+        endpoints,
+        ptf_params,
+        num_packets=num_packets,
+        mac_list=mac_list,
+        vni_list=vni_list
     )
 
     logger.info("MAC+VNI multi-endpoint scale test completed successfully")
@@ -467,7 +528,6 @@ def test_ecmp_scale_modify_mac(ptfhost, one_vnet_setup_teardown):
         "mac_vni_verify": "yes",
         "modified_mac_index": mod_idx,
         "modified_mac_value": new_mac,
-        "vni": VNI,
     }
 
     num_packets = num * PACKET_MULTIPLIER
@@ -477,5 +537,6 @@ def test_ecmp_scale_modify_mac(ptfhost, one_vnet_setup_teardown):
         endpoints,
         ptf_params,
         num_packets=num_packets,
-        mac_list=mac_list
+        mac_list=mac_list,
+        vni_list=[VNI]
     )
