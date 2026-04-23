@@ -42,20 +42,20 @@ GNMI_PATH_PREFIX = "CONFIG_DB/localhost"
 temp_files = []
 
 
-def validate_encap_wl_to_t1(duthost, ptfadapter, wl_portchannel_info, subintfs_info, test_configs):
+def validate_encap_wl_to_t1(duthost, ptfadapter, test_configs):
     logger.info("Starting WL to T1 VXLAN encapsulation test...")
 
-    for _, val in subintfs_info.items():
+    for configs in test_configs:
         # Build inner TCP packet to inject from southbound side
         pkt_opts = {
             "eth_dst": duthost.facts['router_mac'],
-            "eth_src": ptfadapter.dataplane.get_mac(0, val["ptf_port_index"]),
-            "ip_dst": "150.0.0.10",
+            "eth_src": ptfadapter.dataplane.get_mac(0, configs["outgoing_port"]),
+            "ip_dst": configs["inner_dst_ip"],
             "ip_src": INNER_SRC_IP,
             "ip_id": 105,
             "ip_ttl": 64,
             "dl_vlan_enable": True,
-            "vlan_vid": val["vlan"],
+            "vlan_vid": configs["vlan"],
             "tcp_sport": 1234,
             "tcp_dport": 5000,
             "pktlen": 100
@@ -64,9 +64,8 @@ def validate_encap_wl_to_t1(duthost, ptfadapter, wl_portchannel_info, subintfs_i
         inner_pkt = testutils.simple_tcp_packet(**pkt_opts)
 
         # Build expected packet
-        vxlan_router_mac = duthost.shell("sonic-db-cli APPL_DB HGET 'SWITCH_TABLE:switch' 'vxlan_router_mac'")
         pkt_opts["eth_src"] = INNER_SRC_MAC  # expected rewritten inner src mac
-        pkt_opts["eth_dst"] = vxlan_router_mac['stdout'].strip()
+        pkt_opts["eth_dst"] = configs["expected_dst_mac"]
         pkt_opts["ip_ttl"] = 63
         pkt_opts["dl_vlan_enable"] = False
         pkt_opts["pktlen"] = 96  # 100 - 4, remove vlan tag length
@@ -76,14 +75,14 @@ def validate_encap_wl_to_t1(duthost, ptfadapter, wl_portchannel_info, subintfs_i
         expected_pkt = testutils.simple_vxlan_packet(
             eth_dst="aa:bb:cc:dd:ee:ff",
             eth_src=duthost.facts['router_mac'],
-            ip_src=test_configs["loopback_ip"],
-            ip_dst=TUNNEL_ENDPOINT,
+            ip_src=configs["expected_src_ip"],
+            ip_dst=configs["expected_dst_ip"],
             ip_id=0,
             ip_flags=0x2,
             udp_sport=1234,
             udp_dport=VXLAN_PORT,
             with_udp_chksum=False,
-            vxlan_vni=int(val["vnet_vni"]),
+            vxlan_vni=int(configs["expected_vni"]),
             inner_frame=inner_exp_pkt
         )
 
@@ -102,30 +101,23 @@ def validate_encap_wl_to_t1(duthost, ptfadapter, wl_portchannel_info, subintfs_i
         ptfadapter.dataplane.flush()
 
         # Send TCP packet from WL port
-        testutils.send(ptfadapter, val['ptf_port_index'], inner_pkt)
+        testutils.send(ptfadapter, configs["outgoing_port"], inner_pkt)
 
         # Verify VXLAN encapsulated pkt on T1 port with rewritten inner src MAC
-        testutils.verify_packet_any_port(ptfadapter, masked_expected_pkt, test_configs["t1_ptf_port_nums"], timeout=2)
+        testutils.verify_packet_any_port(ptfadapter, masked_expected_pkt, configs["expected_ports"], timeout=2)
 
     logger.info("WL to T1 VXLAN encapsulation test passed.")
 
 
-def validate_decap_t1_to_wl(duthost, ptfadapter, wl_portchannel_info, subintfs_info, test_configs):
+def validate_decap_t1_to_wl(duthost, ptfadapter, test_configs):
     logger.info("Starting T1 to WL VXLAN decapsulation test...")
 
-    ports_per_vnet = {}
-    for _, val in subintfs_info.items():
-        vni = val["vnet_vni"]
-        if vni not in ports_per_vnet:
-            ports_per_vnet[vni] = []
-        ports_per_vnet[vni].append(val["ptf_port_index"])
-
-    for _, val in subintfs_info.items():
+    for configs in test_configs:
         pkt_opts = {
             "eth_dst": "aa:bb:cc:dd:ee:ff",
             "eth_src": duthost.facts['router_mac'],
             "ip_src": "8.8.8.8",
-            "ip_dst": "10.11.255.255",
+            "ip_dst": configs["inner_dst_ip"],
             "tcp_sport": 1234,
             "tcp_dport": 4321,
             "pktlen": 100
@@ -137,18 +129,18 @@ def validate_decap_t1_to_wl(duthost, ptfadapter, wl_portchannel_info, subintfs_i
         # Build VXLAN encapsulated packet to inject from T1 side
         vxlan_pkt = testutils.simple_vxlan_packet(
             eth_dst=duthost.facts['router_mac'],
-            eth_src=ptfadapter.dataplane.get_mac(0, test_configs["t1_ptf_port_nums"][0]),
+            eth_src=ptfadapter.dataplane.get_mac(0, configs["outgoing_port"]),
             ip_src="1.1.1.1",
-            ip_dst=test_configs["loopback_ip"],
+            ip_dst=configs["expected_dst_ip"],
             udp_sport=1234,
             udp_dport=VXLAN_PORT,
             with_udp_chksum=False,
-            vxlan_vni=int(val["vnet_vni"]),
+            vxlan_vni=int(configs["vni"]),
             inner_frame=inner_pkt
         )
 
         # Build expected inner packet after decapsulation
-        pkt_opts["vlan_vid"] = val["vlan"]
+        pkt_opts["vlan_vid"] = configs["vlan"]
         pkt_opts["dl_vlan_enable"] = True
         pkt_opts["pktlen"] = 104     # 100 + 4, add vlan tag length
         expected_inner_pkt = testutils.simple_tcp_packet(**pkt_opts)
@@ -167,10 +159,10 @@ def validate_decap_t1_to_wl(duthost, ptfadapter, wl_portchannel_info, subintfs_i
         ptfadapter.dataplane.flush()
 
         # Send VXLAN encapsulated pkt from T1 port
-        testutils.send(ptfadapter, test_configs["t1_ptf_port_nums"][0], vxlan_pkt)
+        testutils.send(ptfadapter, configs["outgoing_port"], vxlan_pkt)
 
         # Verify decapsulated unencapsulated packet on southbound port
-        testutils.verify_packet_any_port(ptfadapter, masked_expected_pkt, ports_per_vnet[val["vnet_vni"]], timeout=2)
+        testutils.verify_packet_any_port(ptfadapter, masked_expected_pkt, configs["expected_ports"], timeout=2)
 
     logger.info("T1 to WL VXLAN decapsulation test passed.")
 
@@ -327,6 +319,36 @@ def generate_subintfs_ips(num_vnets, num_portchannels, start_ip_int, prefix_size
     return all_subintf_ips, all_ptf_ips
 
 
+def generate_vnet_routes(vnet_vnis, start_prefix_int, start_endpoint_int, start_vni,
+                         num_routes_per_vnet, include_default_route=True, offset=0):
+    """
+    Generate vnet routes with prefix, endpoint, mac, and vni.
+    """
+    routes = {vni: [] for vni in vnet_vnis}
+    for i, vni in enumerate(vnet_vnis):
+        for j in range(1, num_routes_per_vnet + 1):
+            prefix_int = start_prefix_int + (i << 8) + j + offset
+            endpoint_int = start_endpoint_int + (i << 8) + j + offset
+            route = {
+                "prefix": convert_ip_int_to_str(prefix_int, 32),
+                "endpoint": convert_ip_int_to_str(endpoint_int).split('/')[0],
+                "vni": start_vni + (i * num_routes_per_vnet) + j,
+                "mac_address": f"52:54:00:{(i << 8 + j + offset)//256:02x}:{(i << 8 + j + offset)%256:02x}:aa"
+            }
+            routes[vni].append(route)
+
+        if include_default_route:
+            route = {
+                "prefix": "0.0.0.0/0",
+                "endpoint": convert_ip_int_to_str(start_endpoint_int).split('/')[0],
+                "vni": start_vni,
+                "mac_address": f"52:54:00:00:00:00"
+            }
+            routes[vni].append(route)
+
+    return routes
+
+
 def gnmic_set_with_bypass(gnmi_tls, path, value, filename="test_config"):
     """
     Send GNMI set request with bypass.
@@ -334,7 +356,7 @@ def gnmic_set_with_bypass(gnmi_tls, path, value, filename="test_config"):
     gnmi_tls.gnmic.set(path, value, metadata="x-sonic-ss-bypass-validation=true", filename=filename)
 
 
-def setup_acl_config(duthost, ports, vnet_vnis, gnmi_tls):
+def setup_acl_config(duthost, ports, vnet_vnis, vnet_routes, gnmi_tls):
     """
     Add a custom ACL table type definition to CONFIG_DB.
     """
@@ -365,12 +387,12 @@ def setup_acl_config(duthost, ports, vnet_vnis, gnmi_tls):
     }, "acl_table")
 
     gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/ACL_RULE", {
-        f"{ACL_TABLE_NAME}|rule_{vni}": {
+        f"{ACL_TABLE_NAME}|rule_{route['vni']}": {
             "INNER_SRC_IP": f"{INNER_SRC_IP}/32",
             "INNER_SRC_MAC_REWRITE_ACTION": INNER_SRC_MAC,
-            "TUNNEL_VNI": f"{vni}",
-            "PRIORITY": f"{vni}"
-        } for vni in vnet_vnis
+            "TUNNEL_VNI": f"{route['vni']}",
+            "PRIORITY": f"{route['vni']}"
+        } for vni in vnet_vnis for route in vnet_routes[vni]
     }, "acl_rule")
 
     # Check acl table and rules are set
@@ -383,20 +405,23 @@ def setup_acl_config(duthost, ports, vnet_vnis, gnmi_tls):
         rule_key = f"STATE_DB/localhost/ACL_RULE_TABLE"
         acl_rules = gnmi_tls.gnmic.get(rule_key)[0].get("updates")[0].get("values", {}).get(rule_key, {})
         for vni in vnet_vnis:
-            acl_rule_status = acl_rules.get(f"{ACL_TABLE_NAME}|rule_{vni}", {}).get("status", "")
-            if acl_rule_status.lower() != "active":
-                return False
+            for route in vnet_routes[vni]:
+                acl_rule_status = acl_rules.get(f"{ACL_TABLE_NAME}|rule_{route['vni']}", {}).get("status", "")
+                if acl_rule_status.lower() != "active":
+                    return False
         return True
 
     pytest_assert(wait_until(60, 2, 0, _acl_table_and_rule_active, duthost),
                   f"ACL table {ACL_TABLE_NAME} or its rules not active after 60 seconds.")
 
 
-def setup_vnet_routes(duthost, vnet_vnis, gnmi_tls):
+def setup_vnet_routes(vnet_vnis, vni_to_routes, gnmi_tls):
     gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/VNET_ROUTE_TUNNEL", {
-        f"Vnet{vni}|0.0.0.0/0": {
-            "endpoint": TUNNEL_ENDPOINT
-        } for vni in vnet_vnis
+        f"Vnet{vni}|{route['prefix']}": {
+            "endpoint": route["endpoint"],
+            "vni": route["vni"],
+            "mac_address": route["mac_address"]
+        } for vni in vnet_vnis for route in vni_to_routes[vni]
     }, "vnet_routes")
 
     # Check vnet routes are set
@@ -701,11 +726,14 @@ def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, 
             gnmi_tls=gnmi_tls)
 
         # Set up vnet routes
-        setup_vnet_routes(duthost, vnet_vnis, gnmi_tls)
+        vnet_routes = generate_vnet_routes(vnet_vnis, start_prefix_int=convert_str_to_ip_int("30.0.0.0")[0],
+                                           start_endpoint_int=convert_str_to_ip_int(TUNNEL_ENDPOINT)[0],
+                                           start_vni=10000, num_routes_per_vnet=5)
+        setup_vnet_routes(vnet_vnis, vnet_routes, gnmi_tls)
 
         # Setup acl configs
         config_facts = duthost.config_facts(host=duthost.hostname, source="running")['ansible_facts']
-        setup_acl_config(duthost, list(config_facts.get("PORTCHANNEL", {}).keys()), vnet_vnis, gnmi_tls)
+        setup_acl_config(duthost, list(config_facts.get("PORTCHANNEL", {}).keys()), vnet_vnis, vnet_routes, gnmi_tls)
 
         # Configure vxlan port
         ecmp_utils.configure_vxlan_switch(duthost, VXLAN_PORT, "00:12:34:56:78:9a")
@@ -734,22 +762,51 @@ def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, 
         cleanup(duthost, ptfhost, localhost, wl_portchannel_info, subintfs_info)
         pytest.fail(f"Setup failed: {repr(e)}")
 
-    test_configs = {"vnet_vnis": vnet_vnis, "t1_ptf_port_nums": t1_ptf_port_nums, "loopback_ip": loopback_ip}
-    yield duthost, ptfadapter, wl_portchannel_info, subintfs_info, test_configs
+    ports_per_vnet = {}
+    for _, val in subintfs_info.items():
+        vni = val["vnet_vni"]
+        if vni not in ports_per_vnet:
+            ports_per_vnet[vni] = []
+        ports_per_vnet[vni].append(val["ptf_port_index"])
+
+    decap_test_configs = [
+        {
+            "inner_dst_ip": "10.11.255.255",
+            "expected_dst_ip": loopback_ip,
+            "vni": val["vnet_vni"],
+            "vlan": val["vlan"],
+            "outgoing_port": t1_ptf_port_nums[0],
+            "expected_ports": ports_per_vnet[val["vnet_vni"]]
+        } for _, val in subintfs_info.items()
+    ]
+    encap_test_configs = [
+        {
+            "inner_dst_ip": route["prefix"].split('/')[0] if route["prefix"] != "0.0.0.0/0" else "150.0.0.10",
+            "expected_dst_mac": route["mac_address"],
+            "expected_vni": route["vni"],
+            "expected_dst_ip": route["endpoint"],
+            "expected_src_ip": loopback_ip,
+            "vlan": val["vlan"],
+            "vni": val["vnet_vni"],
+            "outgoing_port": val["ptf_port_index"],
+            "expected_ports": t1_ptf_port_nums
+        } for _, val in subintfs_info.items() for route in vnet_routes[val["vnet_vni"]]
+    ]
+    yield duthost, ptfadapter, encap_test_configs, decap_test_configs
 
     # Cleanup
     cleanup(duthost, ptfhost, localhost, wl_portchannel_info, subintfs_info)
 
 
 def test_vnet_with_bgp_intf_smacrewrite(common_setup_and_teardown):
-    duthost, ptfadapter, wl_portchannel_info, subintfs_info, test_configs = common_setup_and_teardown
+    duthost, ptfadapter, encap_test_configs, decap_test_configs = common_setup_and_teardown
 
     config_facts = duthost.config_facts(host=duthost.hostname, source="running")['ansible_facts']
     logger.debug("post-setup config_facts: {}".format(config_facts))
 
-    validate_decap_t1_to_wl(duthost, ptfadapter, wl_portchannel_info, subintfs_info, test_configs)
+    validate_decap_t1_to_wl(duthost, ptfadapter, decap_test_configs)
 
-    validate_encap_wl_to_t1(duthost, ptfadapter, wl_portchannel_info, subintfs_info, test_configs)
+    validate_encap_wl_to_t1(duthost, ptfadapter, encap_test_configs)
 
     # Test datapath again after config reload
     duthost.shell("config save -y")
@@ -759,6 +816,6 @@ def test_vnet_with_bgp_intf_smacrewrite(common_setup_and_teardown):
     # Configure vxlan port
     ecmp_utils.configure_vxlan_switch(duthost, VXLAN_PORT, "00:12:34:56:78:9a")
 
-    validate_decap_t1_to_wl(duthost, ptfadapter, wl_portchannel_info, subintfs_info, test_configs)
+    validate_decap_t1_to_wl(duthost, ptfadapter, decap_test_configs)
 
-    validate_encap_wl_to_t1(duthost, ptfadapter, wl_portchannel_info, subintfs_info, test_configs)
+    validate_encap_wl_to_t1(duthost, ptfadapter, encap_test_configs)
