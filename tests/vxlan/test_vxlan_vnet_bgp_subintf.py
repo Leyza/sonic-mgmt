@@ -6,14 +6,11 @@ from ptf.packet import Ether, IP, UDP, TCP
 import ptf.testutils as testutils
 import pytest
 import time
-from tests.common.gnmi_setup import apply_cert_config, recover_cert_config
 from tests.common.helpers.assertions import pytest_assert, pytest_require
 from tests.common.config_reload import config_reload
 from tests.common.utilities import wait_until
 from tests.common.vxlan_ecmp_utils import Ecmp_Utils
-from tests.common.helpers.dut_utils import check_container_state
-from tests.common.helpers.gnmi_utils import GNMIEnvironment, gnmi_container, create_gnmi_certs, \
-    delete_gnmi_certs
+from tests.common.fixtures.grpc_fixtures import gnmi_tls
 
 ecmp_utils = Ecmp_Utils()
 
@@ -40,7 +37,7 @@ NUM_VNETS = 2
 ACL_TYPE_NAME = "INNER_SRC_MAC_REWRITE_TYPE"
 ACL_TABLE_NAME = "INNER_SRC_MAC_REWRITE_TABLE"
 
-GNMI_PATH_PREFIX = "/CONFIG_DB/localhost"
+GNMI_PATH_PREFIX = "CONFIG_DB/localhost"
 
 temp_files = []
 
@@ -192,9 +189,6 @@ def cleanup(duthost, ptfhost, localhost, wl_portchannel_info, subintfs_info):
     duthost.shell(f"mv {CONFIG_DB_PATH}.bak {CONFIG_DB_PATH}")
     config_reload(duthost, safe_reload=True, check_intf_up_ports=True)
 
-    # clean up gnmi server
-    recover_cert_config(duthost)
-
     cmds = []
     # Remove sub port
     try:
@@ -244,9 +238,6 @@ fi
     for file in temp_files:
         if os.path.exists(file):
             os.remove(file)
-
-    # cleanup gnmi cert files
-    delete_gnmi_certs(localhost)
 
 
 def get_available_vlan_id_and_ports(cfg_facts, num_ports_needed):
@@ -336,33 +327,18 @@ def generate_subintfs_ips(num_vnets, num_portchannels, start_ip_int, prefix_size
     return all_subintf_ips, all_ptf_ips
 
 
-def gnmi_set_update_config_db_json(duthost, ptfhost, path, value, filename="test_config"):
+def gnmic_set_with_bypass(gnmi_tls, path, value, filename="test_config"):
     """
-    Send GNMI set request with GNMI client. This helper will only send add/update requests with a json value format.
+    Send GNMI set request with bypass.
     """
-    filename += ".txt"
-    with open(filename, 'w') as file:
-        file.write(json.dumps(value))
-    ptfhost.copy(src=filename, dest='/tmp')
-
-    env = GNMIEnvironment(duthost, GNMIEnvironment.GNMI_MODE)
-    ip = duthost.mgmt_ip
-    port = env.gnmi_port
-
-    cmd = f"/root/env-python3/bin/python /root/gnxi/gnmi_cli_py/py_gnmicli.py \
-        --timeout 10 -t {ip} -p {port} -xo sonic-db -rcert /root/gnmiCA.pem \
-        -pkey /root/gnmiclient.key -cchain /root/gnmiclient.crt -m set-update \
-        --xpath \"{path}\" --value \"@/tmp/{filename}\""
-    ptfhost.shell(cmd)
-
-    temp_files.append(filename)
+    gnmi_tls.gnmic.set(path, value, metadata="x-sonic-ss-bypass-validation=true", filename=filename)
 
 
-def setup_acl_config(duthost, ptfhost, ports, vnet_vnis):
+def setup_acl_config(duthost, ports, vnet_vnis, gnmi_tls):
     """
     Add a custom ACL table type definition to CONFIG_DB.
     """
-    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/ACL_TABLE_TYPE", {
+    gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/ACL_TABLE_TYPE", {
         ACL_TYPE_NAME: {
             "BIND_POINTS": [
                 "PORT",
@@ -379,7 +355,7 @@ def setup_acl_config(duthost, ptfhost, ports, vnet_vnis):
         }
     }, "acl_type")
 
-    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/ACL_TABLE", {
+    gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/ACL_TABLE", {
         ACL_TABLE_NAME: {
             "policy_desc": ACL_TABLE_NAME,
             "ports": ports,
@@ -388,7 +364,7 @@ def setup_acl_config(duthost, ptfhost, ports, vnet_vnis):
         }
     }, "acl_table")
 
-    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/ACL_RULE", {
+    gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/ACL_RULE", {
         f"{ACL_TABLE_NAME}|rule_{vni}": {
             "INNER_SRC_IP": f"{INNER_SRC_IP}/32",
             "INNER_SRC_MAC_REWRITE_ACTION": INNER_SRC_MAC,
@@ -399,17 +375,16 @@ def setup_acl_config(duthost, ptfhost, ports, vnet_vnis):
 
     # Check acl table and rules are set
     def _acl_table_and_rule_active(duthost):
-        acl_table = duthost.shell(
-            f"sonic-db-cli STATE_DB HGET 'ACL_TABLE_TABLE|{ACL_TABLE_NAME}' 'status'",
-            module_ignore_errors=True)
-        if acl_table.get('stdout', '').strip().lower() != "active":
+        table_key = f"STATE_DB/localhost/ACL_TABLE_TABLE/{ACL_TABLE_NAME}/status"
+        acl_table_status = gnmi_tls.gnmic.get(table_key)[0].get("updates")[0].get("values", {}).get(table_key, {})
+        if acl_table_status.lower() != "active":
             return False
 
+        rule_key = f"STATE_DB/localhost/ACL_RULE_TABLE"
+        acl_rules = gnmi_tls.gnmic.get(rule_key)[0].get("updates")[0].get("values", {}).get(rule_key, {})
         for vni in vnet_vnis:
-            acl_rule = duthost.shell(
-                f"sonic-db-cli STATE_DB HGET 'ACL_RULE_TABLE|{ACL_TABLE_NAME}|rule_{vni}' 'status'",
-                module_ignore_errors=True)
-            if acl_rule.get('stdout', '').strip().lower() != "active":
+            acl_rule_status = acl_rules.get(f"{ACL_TABLE_NAME}|rule_{vni}", {}).get("status", "")
+            if acl_rule_status.lower() != "active":
                 return False
         return True
 
@@ -417,8 +392,8 @@ def setup_acl_config(duthost, ptfhost, ports, vnet_vnis):
                   f"ACL table {ACL_TABLE_NAME} or its rules not active after 60 seconds.")
 
 
-def setup_vnet_routes(duthost, ptfhost, vnet_vnis):
-    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VNET_ROUTE_TUNNEL", {
+def setup_vnet_routes(duthost, vnet_vnis, gnmi_tls):
+    gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/VNET_ROUTE_TUNNEL", {
         f"Vnet{vni}|0.0.0.0/0": {
             "endpoint": TUNNEL_ENDPOINT
         } for vni in vnet_vnis
@@ -427,23 +402,22 @@ def setup_vnet_routes(duthost, ptfhost, vnet_vnis):
     # Check vnet routes are set
     time.sleep(5)
     for vni in vnet_vnis:
-        route_tunnel = duthost.shell(f"sonic-db-cli STATE_DB HGET \
-                                     'VNET_ROUTE_TUNNEL_TABLE|Vnet{vni}|0.0.0.0/0' 'state'")
-        pytest_assert(route_tunnel['stdout'].strip().lower() == "active",
+        route_key = f"STATE_DB/localhost/VNET_ROUTE_TUNNEL_TABLE"
+        route_status = gnmi_tls.gnmic.get(route_key)[0].get("updates")[0].get("values", {}).get(route_key, {})\
+            .get(f"Vnet{vni}|0.0.0.0/0", {}).get("state", "")
+        pytest_assert(route_status.lower() == "active",
                       f"VNET route tunnel for Vnet{vni} not active.")
 
 
-def setup_bgp(duthost, ptfhost, vnet_vnis, dut_ips, ptf_ips, subnet_ip, loopback_ip, bgp_port, vnet_route_ip):
+def setup_bgp(duthost, ptfhost, vnet_vnis, dut_ips, ptf_ips, subnet_ip, loopback_ip, bgp_port, vnet_route_ip, gnmi_tls):
     config_facts = duthost.config_facts(host=duthost.hostname, source="running")['ansible_facts']
     dut_asn = config_facts['DEVICE_METADATA']['localhost']['bgp_asn']
     neighbors = config_facts['BGP_NEIGHBOR']
     peer_asn = list(neighbors.values())[0]["asn"]
 
     for vni in vnet_vnis:
-        gnmi_set_update_config_db_json(
-            duthost,
-            ptfhost,
-            f"{GNMI_PATH_PREFIX}/BGP_PEER_RANGE/Vnet{vni}|WLPARTNER_PASSIVE_V4",
+        gnmic_set_with_bypass(gnmi_tls,
+            f"{GNMI_PATH_PREFIX}/BGP_PEER_RANGE/Vnet{vni}\|WLPARTNER_PASSIVE_V4",
             {
                 "ip_range": [subnet_ip],
                 "name": "WLPARTNER_PASSIVE_V4",
@@ -495,7 +469,7 @@ neighbor {dut_ip.split('/')[0]} {{
                           and int(val["state/pfxrcd"]) > 0, f"BGP neighbor not found for vnet Vnet{vni}.")
 
 
-def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, base_vlan, dut_ips, ptf_ips):
+def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, base_vlan, dut_ips, ptf_ips, gnmi_tls):
     config_facts = duthost.config_facts(host=duthost.hostname, source="running")['ansible_facts']
     has_subintfs = len(config_facts.get("VLAN_SUB_INTERFACE", {})) > 0
 
@@ -509,7 +483,7 @@ def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, ba
             subintf_name = f"Po{po_num}.{base_vlan + i}"
 
             if not has_subintfs:
-                gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE", {
+                gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE", {
                     subintf_name: {
                         "admin_status": "up",
                         "vlan": str(base_vlan + i),
@@ -519,21 +493,19 @@ def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, ba
                 }, subintf_name)
                 has_subintfs = True
             else:
-                gnmi_set_update_config_db_json(
-                    duthost,
-                    ptfhost,
-                    f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}",
+                gnmic_set_with_bypass(
+                    gnmi_tls, 
+                    f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}", 
                     {
                         "admin_status": "up",
                         "vlan": str(base_vlan + i),
                         "vnet_name": f"Vnet{vnet_vnis[i]}"
                     },
                     subintf_name)
-                gnmi_set_update_config_db_json(
-                    duthost,
-                    ptfhost,
-                    f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}|{dut_ips[j][i].replace('/','~1')}",
-                    {},
+                gnmic_set_with_bypass(
+                    gnmi_tls, 
+                    f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}\|{dut_ips[j][i].replace('/','~1')}", 
+                    {}, 
                     f"{subintf_name}_ip")
 
             # Configure ptf port commands
@@ -557,10 +529,21 @@ def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, ba
     ptfhost.shell("supervisorctl restart ptf_nn_agent")
     time.sleep(5)
 
+    # Check subinterfaces are up in state db
+    interfaces_key = f"STATE_DB/localhost/INTERFACE_TABLE"
+    interfaces = gnmi_tls.gnmic.get(interfaces_key)[0].get("updates")[0].get("values", {}).get(interfaces_key, {})
+    for subintf, values in subintfs_info.items():
+        subintf_vnet = interfaces.get(subintf, {}).get("vrf", "")
+        subintf_status = interfaces.get(f"{subintf}|{values['dut_ip']}", {}).get("state", "")
+
+        pytest_assert(subintf_vnet.lower() == values["vnet"].lower(), f"Subinterface {subintf} not in correct vnet. \
+                      Expected {values['vnet']}, got {subintf_vnet}.")
+        pytest_assert(subintf_status.lower() == "ok", f"Subinterface {subintf} not in ok state.")
+
     return subintfs_info
 
 
-def setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_available_in_topo):
+def setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_available_in_topo, gnmi_tls):
     vlan_id, ports = get_available_vlan_id_and_ports(config_facts, len(PORTCHANNEL_NAMES))
     pytest_assert(len(ports) == len(PORTCHANNEL_NAMES),
                   f"Found {len(ports)} available ports. Needed {len(PORTCHANNEL_NAMES)} ports for the test.")
@@ -570,13 +553,12 @@ def setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_a
     for i in range(len(PORTCHANNEL_NAMES)):
         duthost.shell(f'config vlan member del {vlan_id} {ports[i]}')
 
-        gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/PORTCHANNEL/{PORTCHANNEL_NAMES[i]}", {
+        gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/PORTCHANNEL/{PORTCHANNEL_NAMES[i]}", {
             "admin_status": "up"
         }, PORTCHANNEL_NAMES[i])
-        gnmi_set_update_config_db_json(
-            duthost,
-            ptfhost,
-            f"{GNMI_PATH_PREFIX}/PORTCHANNEL_MEMBER/{PORTCHANNEL_NAMES[i]}|{ports[i]}",
+        gnmic_set_with_bypass(
+            gnmi_tls,
+            f"{GNMI_PATH_PREFIX}/PORTCHANNEL_MEMBER/{PORTCHANNEL_NAMES[i]}\|{ports[i]}",
             {},
             f"{PORTCHANNEL_NAMES[i]}_member")
 
@@ -604,43 +586,48 @@ def setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_a
     ptfhost.shell("supervisorctl restart ptf_nn_agent")
     time.sleep(5)
 
+    # Validate portchannel is up in state db
+    for portchannel_name in PORTCHANNEL_NAMES:
+        portchannel_key = f"STATE_DB/localhost/LAG_TABLE/{portchannel_name}"
+        portchannel_status = gnmi_tls.gnmic.get(portchannel_key)[0].get("updates")[0].get("values", {})\
+            .get(portchannel_key, {})
+        
+        pytest_assert(portchannel_status.get("admin_status", "").lower() == "up" 
+                      and portchannel_status.get("oper_status", "").lower() == "up",
+                      f"Portchannel {portchannel_name} not up in state db.")
+
     return wl_portchannel_mapping_info
 
 
-def setup_vnets(duthost, ptfhost, num_vnets, tunnel, base_vni):
-    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VNET", {
+def setup_vnets(num_vnets, tunnel, base_vni, gnmi_tls):
+    gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/VNET", {
         f"Vnet{base_vni + i}": {
             "vni": f"{base_vni + i}",
             "vxlan_tunnel": tunnel
         } for i in range(num_vnets)
     }, "vnet")
 
+    # Validate vnet is set in state db
+    for i in range(num_vnets):
+        vnet_name = f"Vnet{base_vni + i}"
+        vnet_key = f"STATE_DB/localhost/VRF_TABLE/{vnet_name}/state"
+        vnet_status = gnmi_tls.gnmic.get(vnet_key)[0].get("updates")[0].get("values", {}).get(vnet_key, {})
+
+        pytest_assert(vnet_status.lower() == "ok", f"Vnet {vnet_name} not in ok state.")
+
     return [base_vni + i for i in range(num_vnets)]
 
 
-def setup_vxlan_tunnel(duthost, ptfhost, name, src_ip):
-    gnmi_set_update_config_db_json(duthost, ptfhost, f"{GNMI_PATH_PREFIX}/VXLAN_TUNNEL", {
+def setup_vxlan_tunnel(name, src_ip, gnmi_tls):
+    gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/VXLAN_TUNNEL", {
         name: {
             "src_ip": src_ip
         }
     }, "vxlan")
 
 
-def setup_gnmi_server(duthost, localhost, ptfhost):
-    '''
-    Setup GNMI server with client certificates
-    '''
-    # Check if GNMI is enabled on the device
-    pytest_require(
-        check_container_state(duthost, gnmi_container(duthost), should_be_running=True),
-        "Test was not supported on devices which do not support GNMI!")
-
-    create_gnmi_certs(duthost, localhost, ptfhost)
-    apply_cert_config(duthost)
-
-
 @pytest.fixture(scope="module")
-def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, ptfadapter, localhost):
+def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, ptfadapter, localhost, gnmi_tls):
     duthost = duthosts[rand_one_dut_hostname]
 
     # backup config_db.json for cleanup
@@ -667,9 +654,6 @@ def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, 
                 "name": "eth{}".format(int(key))
             }
 
-        # setup gnmi server
-        setup_gnmi_server(duthost, localhost, ptfhost)
-
         # Remove everflow acl tables
         duthost.remove_acl_table("EVERFLOW")
         duthost.remove_acl_table("EVERFLOWV6")
@@ -682,14 +666,14 @@ def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, 
         subnet_ip_int, _ = convert_str_to_ip_int(subnet_ip)
 
         # Set up vxlan
-        setup_vxlan_tunnel(duthost, ptfhost, "tunnel_v4", loopback_ip)
+        setup_vxlan_tunnel("tunnel_v4", loopback_ip, gnmi_tls)
 
         #  Set up vnets
-        vnet_vnis = setup_vnets(duthost, ptfhost, NUM_VNETS, "tunnel_v4", BASE_VNI)
+        vnet_vnis = setup_vnets(NUM_VNETS, "tunnel_v4", BASE_VNI, gnmi_tls)
 
         # Set up portchannels
         wl_portchannel_info = setup_portchannels(duthost, ptfhost, config_facts,
-                                                 port_indexes, ptf_ports_available_in_topo)
+                                                 port_indexes, ptf_ports_available_in_topo, gnmi_tls)
 
         # Set up subintfs
         dut_ips, ptf_ips = generate_subintfs_ips(NUM_VNETS, len(PORTCHANNEL_NAMES), start_ip_int=subnet_ip_int)
@@ -700,7 +684,8 @@ def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, 
             vnet_vnis,
             base_vlan=10,
             dut_ips=dut_ips,
-            ptf_ips=ptf_ips)
+            ptf_ips=ptf_ips,
+            gnmi_tls=gnmi_tls)
 
         # Set up bgps
         setup_bgp(
@@ -712,14 +697,15 @@ def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, 
             subnet_ip,
             loopback_ip,
             bgp_port=EXABGP_PORT,
-            vnet_route_ip=subnet_ip)
+            vnet_route_ip=subnet_ip,
+            gnmi_tls=gnmi_tls)
 
         # Set up vnet routes
-        setup_vnet_routes(duthost, ptfhost, vnet_vnis)
+        setup_vnet_routes(duthost, vnet_vnis, gnmi_tls)
 
         # Setup acl configs
         config_facts = duthost.config_facts(host=duthost.hostname, source="running")['ansible_facts']
-        setup_acl_config(duthost, ptfhost, list(config_facts.get("PORTCHANNEL", {}).keys()), vnet_vnis)
+        setup_acl_config(duthost, list(config_facts.get("PORTCHANNEL", {}).keys()), vnet_vnis, gnmi_tls)
 
         # Configure vxlan port
         ecmp_utils.configure_vxlan_switch(duthost, VXLAN_PORT, "00:12:34:56:78:9a")
