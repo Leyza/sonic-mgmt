@@ -327,13 +327,14 @@ def generate_vnet_routes(vnet_vnis, start_prefix_int, start_endpoint_int, start_
     routes = {vni: [] for vni in vnet_vnis}
     for i, vni in enumerate(vnet_vnis):
         for j in range(1, num_routes_per_vnet + 1):
-            prefix_int = start_prefix_int + (i << 8) + j + offset
+            prefix_int = start_prefix_int + (i << 8) + j
             endpoint_int = start_endpoint_int + (i << 8) + j + offset
             route = {
                 "prefix": convert_ip_int_to_str(prefix_int, 32),
                 "endpoint": convert_ip_int_to_str(endpoint_int).split('/')[0],
                 "vni": start_vni + (i * num_routes_per_vnet) + j,
-                "mac_address": f"52:54:00:{(i << 8 + j + offset)//256:02x}:{(i << 8 + j + offset)%256:02x}:aa"
+                "mac_address": f"52:54:00:{(i << 8 + j + offset)//256:02x}:{(i << 8 + j + offset)%256:02x}:aa",
+                "vnet_vni": vni
             }
             routes[vni].append(route)
 
@@ -342,7 +343,8 @@ def generate_vnet_routes(vnet_vnis, start_prefix_int, start_endpoint_int, start_
                 "prefix": "0.0.0.0/0",
                 "endpoint": convert_ip_int_to_str(start_endpoint_int).split('/')[0],
                 "vni": start_vni,
-                "mac_address": f"52:54:00:00:00:00"
+                "mac_address": f"52:54:00:00:00:00",
+                "vnet_vni": vni
             }
             routes[vni].append(route)
 
@@ -427,11 +429,12 @@ def setup_vnet_routes(vnet_vnis, vni_to_routes, gnmi_tls):
     # Check vnet routes are set
     time.sleep(5)
     for vni in vnet_vnis:
-        route_key = f"STATE_DB/localhost/VNET_ROUTE_TUNNEL_TABLE"
-        route_status = gnmi_tls.gnmic.get(route_key)[0].get("updates")[0].get("values", {}).get(route_key, {})\
-            .get(f"Vnet{vni}|0.0.0.0/0", {}).get("state", "")
-        pytest_assert(route_status.lower() == "active",
-                      f"VNET route tunnel for Vnet{vni} not active.")
+        for route in vni_to_routes[vni]:
+            route_key = f"STATE_DB/localhost/VNET_ROUTE_TUNNEL_TABLE"
+            route_status = gnmi_tls.gnmic.get(route_key)[0].get("updates")[0].get("values", {}).get(route_key, {})\
+                .get(f"Vnet{vni}|{route['prefix']}", {}).get("state", "")
+            pytest_assert(route_status.lower() == "active",
+                        f"VNET route tunnel for Vnet{vni}|{route['prefix']} not active.")
 
 
 def setup_bgp(duthost, ptfhost, vnet_vnis, dut_ips, ptf_ips, subnet_ip, loopback_ip, bgp_port, vnet_route_ip, gnmi_tls):
@@ -519,8 +522,8 @@ def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, ba
                 has_subintfs = True
             else:
                 gnmic_set_with_bypass(
-                    gnmi_tls, 
-                    f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}", 
+                    gnmi_tls,
+                    f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}",
                     {
                         "admin_status": "up",
                         "vlan": str(base_vlan + i),
@@ -528,9 +531,9 @@ def setup_portchannel_subintfs(duthost, ptfhost, portchannel_info, vnet_vnis, ba
                     },
                     subintf_name)
                 gnmic_set_with_bypass(
-                    gnmi_tls, 
-                    f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}\|{dut_ips[j][i].replace('/','~1')}", 
-                    {}, 
+                    gnmi_tls,
+                    f"{GNMI_PATH_PREFIX}/VLAN_SUB_INTERFACE/{subintf_name}\|{dut_ips[j][i].replace('/','~1')}",
+                    {},
                     f"{subintf_name}_ip")
 
             # Configure ptf port commands
@@ -616,8 +619,8 @@ def setup_portchannels(duthost, ptfhost, config_facts, port_indexes, ptf_ports_a
         portchannel_key = f"STATE_DB/localhost/LAG_TABLE/{portchannel_name}"
         portchannel_status = gnmi_tls.gnmic.get(portchannel_key)[0].get("updates")[0].get("values", {})\
             .get(portchannel_key, {})
-        
-        pytest_assert(portchannel_status.get("admin_status", "").lower() == "up" 
+
+        pytest_assert(portchannel_status.get("admin_status", "").lower() == "up"
                       and portchannel_status.get("oper_status", "").lower() == "up",
                       f"Portchannel {portchannel_name} not up in state db.")
 
@@ -789,20 +792,80 @@ def common_setup_and_teardown(tbinfo, duthosts, rand_one_dut_hostname, ptfhost, 
             "vlan": val["vlan"],
             "vni": val["vnet_vni"],
             "outgoing_port": val["ptf_port_index"],
-            "expected_ports": t1_ptf_port_nums
+            "expected_ports": t1_ptf_port_nums,
+            "route": route
         } for _, val in subintfs_info.items() for route in vnet_routes[val["vnet_vni"]]
     ]
-    yield duthost, ptfadapter, encap_test_configs, decap_test_configs
+    yield duthost, ptfadapter, gnmi_tls, encap_test_configs, decap_test_configs
 
     # Cleanup
     cleanup(duthost, ptfhost, localhost, wl_portchannel_info, subintfs_info)
 
 
+def modify_routes_mac_vni(gnmi_tls, encap_test_configs, offset=0):
+    modified_routes = set()
+    acl_rule_value = {}
+
+    for config in encap_test_configs:
+        route = config["route"]
+
+        if route["prefix"] not in modified_routes:
+            route["vni"] += offset
+            route["mac_address"] = route["mac_address"][:-2] + \
+                "{:02x}".format((int(route["mac_address"][-2:], 16) + offset) % 256)
+            route["endpoint"] = convert_ip_int_to_str(
+                convert_str_to_ip_int(route["endpoint"])[0] + offset
+            ).split('/')[0]
+
+            gnmic_set_with_bypass(
+                gnmi_tls,
+                f"{GNMI_PATH_PREFIX}/VNET_ROUTE_TUNNEL/Vnet{route['vnet_vni']}\|{route['prefix'].replace('/','~1')}",
+                {
+                    "endpoint": route["endpoint"],
+                    "vni": route["vni"],
+                    "mac_address": route["mac_address"]
+                },
+                f"vnet_route_{route['vnet_vni']}_{route['prefix'].replace('/','_')}"
+            )
+            acl_rule_value[f"{ACL_TABLE_NAME}|rule_{route['vni']}"] = {
+                "INNER_SRC_IP": f"{INNER_SRC_IP}/32",
+                "INNER_SRC_MAC_REWRITE_ACTION": INNER_SRC_MAC,
+                "TUNNEL_VNI": f"{route['vni']}",
+                "PRIORITY": f"{route['vni']}"
+            }
+
+            modified_routes.add(route["prefix"])
+
+        config["expected_vni"] = route["vni"]
+        config["expected_dst_mac"] = route["mac_address"]
+        config["expected_dst_ip"] = route["endpoint"]
+
+    # Update src mac rewrite acl to match new vnis
+    gnmic_set_with_bypass(gnmi_tls, f"{GNMI_PATH_PREFIX}/ACL_RULE", acl_rule_value, "acl_rule")
+
+    # Check vnet routes are updated
+    time.sleep(5)
+    for config in encap_test_configs:
+        route_key = f"STATE_DB/localhost/VNET_ROUTE_TUNNEL_TABLE"
+        route_status = gnmi_tls.gnmic.get(route_key)[0].get("updates")[0].get("values", {}).get(route_key, {})\
+            .get(f"Vnet{config['route']['vnet_vni']}|{config['route']['prefix']}", {}).get("state", "")
+        pytest_assert(route_status.lower() == "active",
+                      f"VNET route tunnel for Vnet{config['route']['vnet_vni']}|\
+                        {config['route']['prefix']} not active.")
+
+
 def test_vnet_with_bgp_intf_smacrewrite(common_setup_and_teardown):
-    duthost, ptfadapter, encap_test_configs, decap_test_configs = common_setup_and_teardown
+    duthost, ptfadapter, gnmi_tls, encap_test_configs, decap_test_configs = common_setup_and_teardown
 
     config_facts = duthost.config_facts(host=duthost.hostname, source="running")['ansible_facts']
     logger.debug("post-setup config_facts: {}".format(config_facts))
+
+    validate_decap_t1_to_wl(duthost, ptfadapter, decap_test_configs)
+
+    validate_encap_wl_to_t1(duthost, ptfadapter, encap_test_configs)
+
+    # Test datapath after modifying route mac and vni
+    modify_routes_mac_vni(gnmi_tls, encap_test_configs, offset=1)
 
     validate_decap_t1_to_wl(duthost, ptfadapter, decap_test_configs)
 

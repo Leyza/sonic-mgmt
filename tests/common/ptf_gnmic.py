@@ -140,7 +140,7 @@ class PtfGnmic:
 
     def __repr__(self):
         return self.__str__()
-    
+
     def set(self, path: str, value: str, encoding: str = "json_ietf", timeout: int = 90, metadata: str = None, filename: str = "value") -> Dict:
         """
         Set a value on the target device using gNMI Set operation.
@@ -163,7 +163,7 @@ class PtfGnmic:
         value_content = json.dumps(value, indent=2)
         value_file = f"/tmp/{filename}.json"
         self.ptfhost.copy(content=value_content, dest=value_file)
-    
+
         cmd = f"{self._gnmic_path} -a {self.target}"
 
         if self.plaintext:
